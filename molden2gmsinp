@@ -17,7 +17,7 @@ Options:
                            many times.  SECTION starts with '$' and may be
                            written with or without the '$END' terminator.
                            e.g. --set '$CONTRL SCFTYP=RHF RUNTYP=ENERGY'
-                                --set '$SUBSHL NCORES=2 NHOLES=5 NPARTS=7'
+                                --set '$SYSTEM MWORDS=1000'
   --guess                  Emit '$GUESS GUESS=MOREAD NORB=<n_mo>', where n_mo is
                            the number of MOs actually written to $VEC.
   --basis 'PARAMS'         Emit an extra '$BASIS PARAMS' block (e.g. for a test
@@ -32,19 +32,21 @@ Options:
   -h, --help               Show this help.
 
 Examples:
-  # RASS/FCSCF run
-  molden2gmsinp mol.molden cf.inp \\
-      --set '$CONTRL SCFTYP=RASS RUNTYP=ENERGY ISPHER=0' \\
-      --set '$SUBSHL NCORES=2 NHOLES=5 NPARTS=7' \\
-      --set '$FCOPT BSFTYP=SINGLT' \\
-      --set '$FCDICT MAXLEN=20 LDIIS=5 DIISST=5E-2 DIISED=1E-8 DIICOF=10 FIXREF=.F.' \\
-      --set '$SYSTEM MWORDS=8000' \\
-      --guess
-
-  # Plain RHF energy
+  # RHF energy
   molden2gmsinp mol.molden rhf.inp \\
       --set '$CONTRL SCFTYP=RHF RUNTYP=ENERGY' \\
       --set '$SYSTEM MWORDS=1000' \\
+      --guess
+
+  # DFT energy, reading the basis from $DATA
+  molden2gmsinp mol.molden dft.inp \\
+      --set '$CONTRL SCFTYP=RHF DFTTYP=B3LYP RUNTYP=ENERGY' \\
+      --set '$SYSTEM MWORDS=2000'
+
+  # Open-shell anion
+  molden2gmsinp mol.molden uhf.inp \\
+      --set '$CONTRL SCFTYP=UHF RUNTYP=ENERGY' \\
+      --charge -1 --mult 2 --title 'anion doublet' \\
       --guess
 """
 

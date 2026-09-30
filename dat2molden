@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dat2molden.py — Parse GAMESS text punch (.dat) file to generate a Molden file.
+dat2molden.py - Parse a GAMESS text punch (.dat) file to generate a Molden file.
 
 Reads:
   - Atoms from .gms
