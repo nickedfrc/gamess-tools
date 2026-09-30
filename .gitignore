@@ -1,0 +1,7 @@
+# This working copy also holds unrelated research material (LaTeX, zip, docx,
+# pdf).  Ignore everything, then force-add only the tools themselves.
+*
+!.gitignore
+!dat2molden
+!molden2gmsinp
+!README.md

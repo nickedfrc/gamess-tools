@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""
+molden2gmsinp.py - Build a GAMESS(US) input file from a Molden file.
+
+The Molden file supplies the atoms, the contracted basis set (written into the
+$DATA section) and the MO coefficients (written into the $VEC section).  Every
+GAMESS route section ($CONTRL, $SYSTEM, $SUBSHL, ...) is supplied BY THE USER on
+the command line; nothing is hard-coded and there is no implicit default, so the
+program block is emitted only when it was requested.  Only $DATA, $END and $VEC
+are generated automatically.
+
+Usage:
+  molden2gmsinp [options] <molden_file> <output_inp>
+
+Options:
+  --set 'SECTION PARAMS'   Append/override a GAMESS program block.  May be given
+                           many times.  SECTION starts with '$' and may be
+                           written with or without the '$END' terminator.
+                           e.g. --set '$CONTRL SCFTYP=RHF RUNTYP=ENERGY'
+                                --set '$SUBSHL NCORES=2 NHOLES=5 NPARTS=7'
+  --guess                  Emit '$GUESS GUESS=MOREAD NORB=<n_mo>', where n_mo is
+                           the number of MOs actually written to $VEC.
+  --basis 'PARAMS'         Emit an extra '$BASIS PARAMS' block (e.g. for a test
+                           run that should not read the basis from $DATA).
+  --charge C               Total charge, written on the $DATA title line as
+                           'ICHARG=C' when C is not 0.  Default: 0.
+  --mult M                 Spin multiplicity, written on the $DATA title line as
+                           'MULT=M' when M is not 1.  Default: 1.
+  --title TEXT             Text for the 2nd line of $DATA.  Default 'Molden import'.
+  --swap A B               Swap MOs A and B (1-based) before writing $VEC.
+                           May be given many times.
+  -h, --help               Show this help.
+
+Examples:
+  # RASS/FCSCF run
+  molden2gmsinp mol.molden cf.inp \\
+      --set '$CONTRL SCFTYP=RASS RUNTYP=ENERGY ISPHER=0' \\
+      --set '$SUBSHL NCORES=2 NHOLES=5 NPARTS=7' \\
+      --set '$FCOPT BSFTYP=SINGLT' \\
+      --set '$FCDICT MAXLEN=20 LDIIS=5 DIISST=5E-2 DIISED=1E-8 DIICOF=10 FIXREF=.F.' \\
+      --set '$SYSTEM MWORDS=8000' \\
+      --guess
+
+  # Plain RHF energy
+  molden2gmsinp mol.molden rhf.inp \\
+      --set '$CONTRL SCFTYP=RHF RUNTYP=ENERGY' \\
+      --set '$SYSTEM MWORDS=1000' \\
+      --guess
+"""
+
+import sys
+import os
+
+ELEMENT_NAMES = {
+    1: 'HYDROGEN', 2: 'HELIUM', 3: 'LITHIUM', 4: 'BERYLLIUM',
+    5: 'BORON', 6: 'CARBON', 7: 'NITROGEN', 8: 'OXYGEN',
+    9: 'FLUORINE', 10: 'NEON', 11: 'SODIUM', 12: 'MAGNESIUM',
+    13: 'ALUMINUM', 14: 'SILICON', 15: 'PHOSPHORUS', 16: 'SULFUR',
+    17: 'CHLORINE', 18: 'ARGON', 19: 'POTASSIUM', 20: 'CALCIUM',
+    26: 'IRON', 35: 'BROMINE', 53: 'IODINE',
+}
+
+ELEMENT_SYMBOLS = {
+    1: 'H', 2: 'He', 3: 'Li', 4: 'Be', 5: 'B', 6: 'C', 7: 'N', 8: 'O',
+    9: 'F', 10: 'Ne', 11: 'Na', 12: 'Mg', 13: 'Al', 14: 'Si', 15: 'P',
+    16: 'S', 17: 'Cl', 18: 'Ar', 19: 'K', 20: 'Ca', 26: 'Fe', 35: 'Br',
+    53: 'I',
+}
+
+SHELL_NFUNC = {'s': 1, 'p': 3, 'd': 6, 'f': 10, 'g': 15, 'h': 21, 'i': 28}
+SHELL_ORDER = {'s': 0, 'p': 1, 'd': 2, 'f': 3, 'g': 4, 'h': 5, 'i': 6}
+
+MAX_COL = 72
+
+
+# --------------------------------------------------------------------------
+# Molden parsing
+# --------------------------------------------------------------------------
+
+def read_molden(filepath):
+    section = None
+    atoms = []
+    gto = []
+    mos = []
+    current_atom_idx = None
+    current_shells = []
+
+    with open(filepath) as f:
+        for line in f:
+            line = line.rstrip()
+            if not line:
+                continue
+
+            if line.startswith('['):
+                section = line.lstrip('[').split(']')[0].strip()
+                continue
+
+            if section == 'Atoms':
+                parts = line.split()
+                if len(parts) >= 6:
+                    elem = parts[0]
+                    atnum = int(parts[1])
+                    chg = float(parts[2])
+                    x = float(parts[3])
+                    y = float(parts[4])
+                    z = float(parts[5])
+                    atoms.append((elem, atnum, chg, x, y, z))
+
+            elif section == 'GTO':
+                parts = line.split()
+                if len(parts) == 2:
+                    if parts[1] == '0':
+                        if current_atom_idx is not None and current_shells:
+                            gto.append((current_atom_idx, current_shells))
+                        current_atom_idx = int(parts[0])
+                        current_shells = []
+                    else:
+                        exp_val = float(parts[0].replace('D', 'E'))
+                        coef = float(parts[1].replace('D', 'E'))
+                        if current_shells:
+                            current_shells[-1][2].append((exp_val, coef))
+                elif len(parts) == 3:
+                    shell_type = parts[0].lower()
+                    nprim = int(parts[1])
+                    current_shells.append((shell_type, nprim, []))
+
+            elif section == 'MO':
+                if line.strip().startswith('Sym='):
+                    mos.append({'sym': line.strip().split('=')[1].strip(), 'coeffs': {}})
+                elif line.strip().startswith('Ene='):
+                    mos[-1]['ene'] = float(line.strip().split('=')[1].strip())
+                elif line.strip().startswith('Spin='):
+                    mos[-1]['spin'] = line.strip().split('=')[1].strip()
+                elif line.strip().startswith('Occup='):
+                    mos[-1]['occup'] = float(line.strip().split('=')[1].strip())
+                else:
+                    parts = line.split()
+                    if len(parts) == 2:
+                        try:
+                            idx = int(parts[0])
+                            val = float(parts[1])
+                            mos[-1]['coeffs'][idx] = val
+                        except ValueError:
+                            pass
+
+    if current_atom_idx is not None and current_shells:
+        gto.append((current_atom_idx, current_shells))
+
+    return atoms, gto, mos
+
+
+def count_ao(gto):
+    n = 0
+    for atom_idx, shells in gto:
+        for shell_type, nprim, prims in shells:
+            n += SHELL_NFUNC.get(shell_type, 1)
+    return n
+
+
+# --------------------------------------------------------------------------
+# User supplied program blocks
+# --------------------------------------------------------------------------
+
+def parse_section_spec(spec):
+    """Split one --set value into (NAME, params) where NAME is upper-case."""
+    text = spec.strip()
+    if text.startswith('$'):
+        text = text[1:]
+    parts = text.split(None, 1)
+    if not parts:
+        raise ValueError('empty section specification')
+    name = parts[0].upper()
+    params = parts[1].strip() if len(parts) > 1 else ''
+    if params.upper().endswith('$END'):
+        params = params[:-len('$END')].strip()
+    tokens = [p for p in params.split() if p.upper() != '$END']
+    return name, tokens
+
+
+def parse_route(args):
+    """Collect --set blocks, keeping first-seen order and merging repeats."""
+    order = []
+    params = {}
+    for spec in args:
+        name, tokens = parse_section_spec(spec)
+        if name not in params:
+            order.append(name)
+            params[name] = []
+        params[name].extend(tokens)
+    return [(name, params[name]) for name in order]
+
+
+def set_param(section, name, value, routes):
+    """Set NAME=value inside SECTION, creating that block if necessary."""
+    key = name.upper()
+    for sec, tokens in routes:
+        if sec != section:
+            continue
+        for pos, token in enumerate(tokens):
+            if token.split('=')[0].upper() == key:
+                tokens[pos] = f'{name}={value}'
+                return
+        tokens.insert(0, f'{name}={value}')
+        return
+    routes.append((section, [f'{name}={value}']))
+
+
+def has_param(section, name, routes):
+    key = name.upper()
+    return any(t.split('=')[0].upper() == key
+               for sec, toks in routes if sec == section for t in toks)
+
+
+def has_section(section, routes):
+    return any(sec == section for sec, _ in routes)
+
+
+def write_route(f, routes):
+    for name, tokens in routes:
+        head = f' ${name}'
+        if not tokens:
+            f.write(head + ' $END\n')
+            continue
+        line = head
+        for token in tokens:
+            if len(line) + 1 + len(token) > MAX_COL:
+                f.write(line + '\n')
+                line = '      ' + token
+            else:
+                line += ' ' + token
+        f.write(line + ' $END\n')
+
+
+# --------------------------------------------------------------------------
+# GAMESS input generation
+# --------------------------------------------------------------------------
+
+def element_name(chg, elem, atnum):
+    """GAMESS wants the element spelled out in $DATA."""
+    z = int(round(chg))
+    if z in ELEMENT_NAMES:
+        return ELEMENT_NAMES[z]
+    if atnum in ELEMENT_NAMES:
+        return ELEMENT_NAMES[atnum]
+    return elem.upper()
+
+
+def write_data_section(f, atoms, gto, title, charge, mult):
+    f.write(' $DATA\n')
+    tline = title
+    if charge != 0:
+        tline += f' ICHARG={charge}'
+    if mult != 1:
+        tline += f' MULT={mult}'
+    f.write(tline + '\n')
+    f.write('C1\n')
+
+    gto_dict = {}
+    for atom_idx, shells in gto:
+        gto_dict[atom_idx] = shells
+
+    for elem, atnum, chg, x, y, z in atoms:
+        name = element_name(chg, elem, atnum)
+        f.write(f'{name:<20s} {chg:8.1f} {x:15.6f} {y:15.6f} {z:15.6f}\n')
+
+        shells = gto_dict.get(atnum, [])
+        shells_sorted = sorted(shells, key=lambda s: SHELL_ORDER.get(s[0], 99))
+        for shell_type, nprim, prims in shells_sorted:
+            st = shell_type.upper()
+            f.write(f' {st}   {nprim}\n')
+            for i, (exp_val, coef) in enumerate(prims):
+                f.write(f' {i+1:3d} {exp_val:20.12f} {coef:20.12f}\n')
+
+        f.write('\n')
+
+    f.write(' $END\n')
+
+
+def write_vec_section(f, mos, total_ao):
+    f.write(' $VEC\n')
+    ao_list = list(range(1, total_ao + 1))
+    for mo_num, mo in enumerate(mos):
+        coeffs = mo['coeffs']
+        full_mo = mo_num + 1
+        mo_label = full_mo % 100
+        batch = 1
+        for i in range(0, len(ao_list), 5):
+            chunk = ao_list[i:i + 5]
+            parts = [f'{mo_label:2d}{batch:3d}']
+            for idx in chunk:
+                parts.append(f'{coeffs.get(idx, 0.0):15.8E}')
+            f.write(''.join(parts) + '\n')
+            batch += 1
+
+    f.write(' $END\n')
+
+
+# --------------------------------------------------------------------------
+# Command line
+# --------------------------------------------------------------------------
+
+def usage(f=None):
+    (f or sys.stdout).write(__doc__.lstrip('\n'))
+
+
+def main():
+    sets = []
+    swap_pairs = []
+    positional = []
+    want_guess = False
+    basis = None
+    charge = 0
+    mult = 1
+    title = 'Molden import'
+
+    argv = sys.argv[1:]
+    i = 0
+    error = None
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ('-h', '--help'):
+            usage()
+            return 0
+        elif arg == '--set':
+            if i + 1 >= len(argv):
+                error = '--set needs a value'
+                break
+            sets.append(argv[i + 1])
+            i += 2
+        elif arg == '--swap':
+            if i + 2 >= len(argv):
+                error = '--swap needs two MO indices'
+                break
+            try:
+                swap_pairs.append((int(argv[i + 1]), int(argv[i + 2])))
+            except ValueError:
+                error = f'--swap expects two integers, got {argv[i+1]!r} {argv[i+2]!r}'
+                break
+            i += 3
+        elif arg == '--guess':
+            want_guess = True
+            i += 1
+        elif arg == '--basis':
+            if i + 1 >= len(argv):
+                error = '--basis needs a value'
+                break
+            basis = argv[i + 1]
+            i += 2
+        elif arg == '--title':
+            if i + 1 >= len(argv):
+                error = '--title needs a value'
+                break
+            title = argv[i + 1]
+            i += 2
+        elif arg == '--charge':
+            if i + 1 >= len(argv):
+                error = '--charge needs a value'
+                break
+            try:
+                charge = int(argv[i + 1])
+            except ValueError:
+                error = f'--charge expects an integer, got {argv[i+1]!r}'
+                break
+            i += 2
+        elif arg == '--mult':
+            if i + 1 >= len(argv):
+                error = '--mult needs a value'
+                break
+            try:
+                mult = int(argv[i + 1])
+            except ValueError:
+                error = f'--mult expects an integer, got {argv[i+1]!r}'
+                break
+            i += 2
+        elif arg in ('-o', '--output'):
+            error = f'unknown option {arg!r}; the output file is the 2nd positional argument'
+            break
+        elif arg.startswith('-') and arg != '-':
+            error = f'unknown option {arg!r}'
+            break
+        else:
+            positional.append(arg)
+            i += 1
+
+    if error:
+        print(f'Error: {error}', file=sys.stderr)
+        print(file=sys.stderr)
+        usage(sys.stderr)
+        return 2
+
+    if len(positional) < 2:
+        usage(sys.stderr)
+        return 2
+
+    molden_file = positional[0]
+    output_file = positional[1]
+
+    if not os.path.exists(molden_file):
+        print(f'Error: file not found: {molden_file}', file=sys.stderr)
+        return 1
+
+    try:
+        routes = parse_route(sets)
+    except ValueError as exc:
+        print(f'Error: bad --set value: {exc}', file=sys.stderr)
+        return 2
+
+    atoms, gto, mos = read_molden(molden_file)
+    total_ao = count_ao(gto)
+
+    for a, b in swap_pairs:
+        ia, ib = a - 1, b - 1
+        if ia < 0 or ib < 0 or ia >= len(mos) or ib >= len(mos):
+            print(f'Error: swap indices {a},{b} out of range (1-{len(mos)})', file=sys.stderr)
+            return 1
+        mos[ia], mos[ib] = mos[ib], mos[ia]
+        print(f'Swapped MO {a} <-> MO {b}')
+
+    if not mos:
+        print('Error: no MO coefficients found in molden file', file=sys.stderr)
+        return 1
+
+    n_mos_missing = total_ao - len(mos)
+    if n_mos_missing > 0:
+        print(f'Padding {n_mos_missing} missing MO(s) with zero vectors')
+        for v in range(n_mos_missing):
+            pad = {k + 1: 0.0 for k in range(total_ao)}
+            mos.append({'sym': '1', 'coeffs': pad, 'ene': 0.0, 'spin': 'Alpha', 'occup': 0.0})
+
+    n_mo = len(mos)
+
+    # NVIRTS / NORB follow the size of $VEC, so fill them in unless the user
+    # already pinned them down with --set.
+    if has_section('SUBSHL', routes) and not has_param('SUBSHL', 'NVIRTS', routes):
+        set_param('SUBSHL', 'NVIRTS', n_mo, routes)
+
+    if want_guess and not has_param('GUESS', 'NORB', routes):
+        set_param('GUESS', 'NORB', n_mo, routes)
+
+    if basis is not None:
+        if any(sec == 'BASIS' for sec, _ in routes):
+            print('Warning: --basis ignored, $BASIS already given with --set', file=sys.stderr)
+        elif not basis.strip():
+            print('Warning: --basis is empty, no $BASIS block written', file=sys.stderr)
+        else:
+            routes.append(('BASIS', basis.split()))
+
+    with open(output_file, 'w') as f:
+        write_route(f, routes)
+        write_data_section(f, atoms, gto, title, charge, mult)
+        write_vec_section(f, mos, total_ao)
+
+    print(f'Written {output_file}')
+    print(f'  Atoms: {len(atoms)}')
+    print(f'  Basis functions: {total_ao}')
+    print(f'  MOs: {n_mo}')
+    if routes:
+        print(f'  Program blocks from command line: {" ".join("$" + s for s, _ in routes)}')
+    else:
+        print('  Program blocks: NONE (only $DATA/$VEC were written; use --set to add them)')
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
